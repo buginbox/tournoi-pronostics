@@ -1,0 +1,21 @@
+# Teste la couche Vercel à chaque modification de la branche release ou d'une PR vers elle.
+name: Tests couche Vercel
+
+on:
+  push:
+    branches: [release, 'synchro/**']
+  pull_request:
+    branches: [release]
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: node --test vercel/*.test.js

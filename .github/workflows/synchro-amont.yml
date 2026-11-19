@@ -1,0 +1,155 @@
+# Récupère les évolutions du projet d'origine, à lancer à la main :
+#   onglet Actions > « Synchroniser avec le projet d'origine » > Run workflow
+#
+# Branches :
+#   main    = copie exacte du projet d'origine (jamais modifiée à la main)
+#   release = main + la couche Vercel ; branche par défaut, déployée en production
+#
+# Déroulé : main est avancée sur l'origine, puis une branche synchro/amont-<commit>
+# est créée avec la fusion origine -> release, testée, et proposée en Pull Request.
+# Vercel construit une préproduction de cette branche : on vérifie, puis on fusionne.
+name: Synchroniser avec le projet d'origine
+
+on:
+  workflow_dispatch:
+    inputs:
+      branche_amont:
+        description: Branche du projet d'origine à récupérer
+        default: main
+        required: true
+      fusion_directe:
+        description: Si pas de conflit et tests OK, fusionner tout de suite dans release (mise en production immédiate)
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: synchro-amont
+  cancel-in-progress: false
+
+env:
+  # Dépôt d'origine : modifiable via Settings > Secrets and variables > Actions > Variables
+  DEPOT_AMONT: ${{ vars.DEPOT_AMONT || '20Sy/tournoi-pronostics' }}
+  BRANCHE_AMONT: ${{ inputs.branche_amont }}
+  BRANCHE_MIROIR: main
+  BRANCHE_DEPLOIEMENT: release
+
+jobs:
+  synchro:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: release
+          fetch-depth: 0
+          # Jeton facultatif (voir VERCEL.md), seulement nécessaire si l'origine
+          # modifie un jour ses propres fichiers .github/workflows
+          token: ${{ secrets.JETON_SYNCHRO || github.token }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Récupérer le projet d'origine
+        id: amont
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add amont "https://github.com/${DEPOT_AMONT}.git"
+          git fetch --no-tags amont "+refs/heads/${BRANCHE_AMONT}:refs/remotes/amont/${BRANCHE_AMONT}"
+          SHA=$(git rev-parse --short "amont/${BRANCHE_AMONT}")
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "branche=synchro/amont-$SHA" >> "$GITHUB_OUTPUT"
+          if git merge-base --is-ancestor "amont/${BRANCHE_AMONT}" HEAD; then
+            echo "nouveau=false" >> "$GITHUB_OUTPUT"
+            echo "### Rien de nouveau : ${DEPOT_AMONT}@${SHA} est déjà intégré à release" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "nouveau=true" >> "$GITHUB_OUTPUT"
+            {
+              echo "### Nouveautés de ${DEPOT_AMONT} (${BRANCHE_AMONT}) à intégrer"
+              echo '```'
+              git log --oneline --no-merges "HEAD..amont/${BRANCHE_AMONT}"
+              echo '```'
+            } | tee -a "$GITHUB_STEP_SUMMARY" > nouveautes.md
+          fi
+
+      - name: Mettre à jour la branche miroir (main)
+        run: |
+          # Avance rapide uniquement : si l'origine a réécrit son historique,
+          # le push est refusé et il faut regarder à la main.
+          git push origin "refs/remotes/amont/${BRANCHE_AMONT}:refs/heads/${BRANCHE_MIROIR}"
+
+      - name: Fusionner l'origine dans une branche de synchro
+        id: fusion
+        if: steps.amont.outputs.nouveau == 'true'
+        run: |
+          git checkout -b "${{ steps.amont.outputs.branche }}"
+          if git merge --no-ff --no-edit -m "Synchro avec ${DEPOT_AMONT}@${{ steps.amont.outputs.sha }}" "amont/${BRANCHE_AMONT}"; then
+            echo "conflit=false" >> "$GITHUB_OUTPUT"
+          else
+            git merge --abort
+            # On propose la version d'origine telle quelle : GitHub montrera les
+            # conflits, à résoudre dans la PR (éditeur web) ou en local.
+            git checkout -B "${{ steps.amont.outputs.branche }}" "amont/${BRANCHE_AMONT}"
+            echo "conflit=true" >> "$GITHUB_OUTPUT"
+            echo "### ⚠️ Conflit de fusion : à résoudre dans la Pull Request" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Tester la couche Vercel sur le résultat
+        id: tests
+        if: steps.amont.outputs.nouveau == 'true' && steps.fusion.outputs.conflit == 'false'
+        run: |
+          if node --test vercel/*.test.js > resultat-tests.txt 2>&1; then
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+            echo "### ✅ Tests de la couche Vercel : OK" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+            { echo "### ❌ Tests de la couche Vercel en échec"; echo '```'; tail -n 60 resultat-tests.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Publier la branche de synchro
+        if: steps.amont.outputs.nouveau == 'true'
+        run: git push --force origin "${{ steps.amont.outputs.branche }}"
+
+      - name: Mise en production directe
+        if: inputs.fusion_directe && steps.tests.outputs.ok == 'true'
+        run: |
+          git push origin "${{ steps.amont.outputs.branche }}:${BRANCHE_DEPLOIEMENT}"
+          echo "### 🚀 Fusionné dans ${BRANCHE_DEPLOIEMENT} : Vercel déploie en production" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Ouvrir la Pull Request
+        if: steps.amont.outputs.nouveau == 'true' && !(inputs.fusion_directe && steps.tests.outputs.ok == 'true')
+        env:
+          GH_TOKEN: ${{ secrets.JETON_SYNCHRO || github.token }}
+          BRANCHE: ${{ steps.amont.outputs.branche }}
+          CONFLIT: ${{ steps.fusion.outputs.conflit }}
+          TESTS: ${{ steps.tests.outputs.ok }}
+        run: |
+          {
+            cat nouveautes.md
+            echo
+            if [ "$CONFLIT" = "true" ]; then
+              echo "⚠️ **Conflit** entre ces évolutions et la couche Vercel : résolvez-le dans cette PR, puis lancez \`node --test vercel/*.test.js\`."
+            elif [ "$TESTS" = "true" ]; then
+              echo "✅ Fusion sans conflit, tests de la couche Vercel OK."
+            else
+              echo "❌ Fusion sans conflit mais **tests en échec** : server.js a changé d'une façon que vercel/adaptateur.js ne gère pas encore. Détails dans le résumé de l'exécution GitHub Actions."
+            fi
+            echo
+            echo "Vérifiez la préproduction Vercel de cette branche (lien ci-dessous), puis fusionnez pour mettre en production."
+          } > corps-pr.md
+          if [ -n "$(gh pr list --head "$BRANCHE" --base "$BRANCHE_DEPLOIEMENT" --json number --jq '.[0].number')" ]; then
+            echo "Une PR existe déjà pour $BRANCHE"
+          else
+            gh pr create --base "$BRANCHE_DEPLOIEMENT" --head "$BRANCHE" \
+              --title "Synchro avec ${DEPOT_AMONT}@${{ steps.amont.outputs.sha }}" --body-file corps-pr.md
+          fi
+
+      - name: Signaler un échec des tests
+        if: steps.tests.outputs.ok == 'false'
+        run: |
+          echo "::error::Les tests de la couche Vercel échouent après fusion : voir la Pull Request"
+          exit 1

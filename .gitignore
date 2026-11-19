@@ -4,3 +4,7 @@ data-corrompu-*.json
 config.json
 .serveur.lock
 node_modules/
+
+# Fork Vercel : ne jamais publier la liaison au projet ni les secrets
+.vercel/
+.env*
